@@ -23,6 +23,7 @@
 
 require @structures.fs
 require @kernel/timer.fs
+\ require @user.fs
 
 \ Registers
 : MSR  $3F4 inputb ;
@@ -50,10 +51,10 @@ BPS SPT * 2 * constant BPC              \ bytes per cylinder
 true  constant device>memory
 false constant memory>device
 
-\ TODO: Implement a timeout here
+
 variable irq6-received
 : wait-irq ( -- )
-    begin irq6-received @ not while halt repeat ;
+    time 4000 + begin dup time <= if ." Drive Timeout " drop exit then irq6-received @ not while halt repeat drop ;
 
 : wait-ready
     128 0 ?do RQM if unloop exit endif 10 ms loop ;
