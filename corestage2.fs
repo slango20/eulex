@@ -124,8 +124,7 @@ variable bcd?
 \ serial-loop
 
 enable-interrupts
-initialize-floppy
-
+initialize-floppy if use-floppy then
 require @user.fs
 
 \ corestage2.fs ends here

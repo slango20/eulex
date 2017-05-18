@@ -1,6 +1,6 @@
 \ floppy.fs --
 
-\ Copyright 2012 (C) David Vazquez
+\ Copyright 2012 (C) Eulex Contributors
 
 \ This file is part of Eulex.
 
@@ -29,6 +29,7 @@ require @kernel/timer.fs
 : DOR  $3F2 inputb ;    : DOR!  $3F2 outputb ;
 : FIFO $3F5 inputb ;    : FIFO! $3F5 outputb ; 
 : CCR! $3F7 outputb ;
+: DSR! $3F4 outputb ;
 
 \ ready to read/write?
 : RQM MSR $80 and ;                             
@@ -47,21 +48,29 @@ variable turn?
 18  constant SPT                        \ sectors per track
 BPS SPT * 2 * constant BPC              \ bytes per cylinder
 
+\ Throw codes for floppy drives
+5 constant drive-timeout                \ Timeout
+6 constant drive-unknown-err            \ Unknown error
+8 constant drive-over-err               \ Too many read errors occurred, bad hardware or bad disk?
+
 true  constant device>memory
 false constant memory>device
 
-: reset-floppy
-    $00 DOR! $0C DOR! ;
-
 variable irq6-received
+
+true constant floppy-debug?
+
 : _wait-irq ( -- ) \ throws error 5 on timeout, defaulting to stopping the word unless a catch is implimented
-    time 4000 + begin dup time <= if 5 throw then irq6-received @ not while halt repeat drop ;
+    time 4000 + begin dup time <= if drop 5 throw then irq6-received @ not while halt repeat drop ;
+
+: reset-floppy
+    $80 DSR! _wait-irq ; \ if this IRQ times out, there's probably a hardware problem
 
 : wait-irq ( -- ) \ wrapper for old wait-irq that resets the controller on timeout
     ['] _wait-irq catch
     case
-      5 of reset-floppy endof
-      dup throw
+      5 of floppy-debug? if ." Floppy Controller Timeout! Resetting... " then reset-floppy endof
+      dup throw \ pass any weird shit on
     endcase ;
 
 : wait-ready
@@ -70,7 +79,28 @@ variable irq6-received
 : read-data  wait-ready FIFO ;
 : write-data wait-ready FIFO! ;
 
-: command irq6-received off write-data ;
+: _command irq6-received off write-data ; 
+
+: check-result ( n -- )
+    $d0 MSR and dup $80 = if
+      true return
+    then drive-unknown-err throw ;
+
+: check-irq ( n -- )
+    case
+      8 of false nip return endof \ sense-interrupt,
+      $03 of false nip return endof \ specify
+      
+      true nip return \ pretty much everything else sends IRQ6
+    endcase ;
+
+: cmd-irq ( n -- ) ( wait for 10ms if command doesn't generate irq6 )
+    check-irq if ['] wait-irq catch
+    0 = not if reset-floppy false then else 10 ms true then ;
+
+: command ( n -- )
+    3 0 do dup _command cmd-irq if ['] check-result catch if return then then loop 8 throw ;
+
 ' write-data alias >>
 ' read-data  alias <<
 
@@ -87,7 +117,7 @@ variable irq6-received
     $0f command 0 >> >> wait-irq  ;
 
 : recalibrate
-    $07 command $00 >> wait-irq  ;
+    $07 command $00 >> wait-irq ;
 
 : xfer-ask ( s h c direction -- )
     device>memory = if $c6 else $c5 then command
@@ -103,7 +133,6 @@ variable irq6-received
 
 : write ( c h s --- st0 st1 c h s )
     swap rot memory>device xfer-ask wait-irq xfer-vry ;
-
 
 \ ISA-DMA
 
@@ -126,52 +155,55 @@ here dma-buffer-size allot constant dma-buffer
 : flip-flop
     $ff $0c outputb ;
 
-: dma-setup ( size -- )
+: mask-dma-2 ( -- )
+    $06 $0a outputb ;
+
+: unmask-dma-2 ( -- )
+    $02 $0a outputb ;
+
+: dma-setup ( size -- ) \ this should ONLY be called from within a DMA mask of channel 2
     flip-flop
-    dma-buffer ( 0 rshift ) $04 outputb
-    dma-buffer   8 rshift   $04 outputb
-    dma-buffer  16 rshift   $81 outputb
-    flip-flop
-    1- dup   $05 outputb
-    8 rshift $05 outputb ;
+    dma-buffer ( 0 rshift ) $04 outputb \ low buffer byte 
+    dma-buffer   8 rshift   $04 outputb \ high buffer byte
+    dma-buffer  16 rshift   $81 outputb \ DMA page address register 2
+    flip-flop 
+    1- dup   $05 outputb \ set length-1 low byte
+    8 rshift $05 outputb ; \ high byte
 
 \ Setup DMA-BUFFER to a operation of reading of U bytes. Note that a
 \ value of zero means $FFFF bytes.
 : dma-read ( u -- )
     disable-interrupts
-    $06 $0a outputb    
+    mask-dma-2    
     dma-setup
-    $46 $0b outputb
-    $02 $0a outputb
+    $46 $0b outputb \ mode register: Single, mem->drive, channel 2 
+    unmask-dma-2
     enable-interrupts ;
 
 \ Setup DMA-BUFFER to a operation of writing of U bytes. Note that a
 \ value of zero means $FFFF bytes.
 : dma-write ( u -- )
     disable-interrupts
-    $06 $0a outputb    
+    mask-dma-2
     dma-setup
-    $4a $0b outputb
-    $02 $0a outputb
+    $4a $0b outputb \ mode register, Single, drive->mem, channel 2
+    unmask-dma-2
     enable-interrupts ;
 
-
-\ Transfers
-
-: dma>addr ( addr u -- )
+: dma>addr ( addr u -- ) \ move DMA buffer contents to address
     dma-buffer -rot move ;
 
-: addr>dma ( addr u -- )
+: addr>dma ( addr u -- ) \ pull address contents into DMA buffer
     dma-buffer swap move ;
 
-: read-sectors ( c h s u -- )
+: read-sectors ( c h s u -- ) \ u is sector count
     turn-on
     BPS * dma-read
     -rot dup seek rot
     sense-interrupt 2drop
     read 2drop 2drop 2drop ;
 
-: write-sectors ( c h s u -- )
+: write-sectors ( c h s u -- ) \ u is sector count
     turn-on
     BPS * dma-write
     -rot dup seek rot
@@ -184,10 +216,9 @@ here dma-buffer-size allot constant dma-buffer
 : write-cylinder ( c -- )
     0 1 SPT 2* write-sectors ;
 
-
-
-: detect-drive ( -- flag ) 
-    $10 $70 outputb $71 inputb 4 rshift 4 = ;
+: detect-drive ( -- flag ) \ TODO: support slave drive
+    $10 $70 outputb \ select floppy register
+    $71 inputb 4 rshift 4 = ; \ pull register contents, bits 4-7 are drive 0
 
 : setup-floppy
     $00 CCR! ;
@@ -196,12 +227,11 @@ here dma-buffer-size allot constant dma-buffer
     irq6-received on
 ; 6 IRQ
 
-: initialize-floppy
+: drive-init
     detect-drive not if exit then
     2000 ['] turn-off TIMER0 set-timer
     irq6-received off
     reset-floppy
-    wait-irq
     sense-interrupt 2drop
     setup-floppy
     specify
@@ -209,6 +239,8 @@ here dma-buffer-size allot constant dma-buffer
     recalibrate
     sense-interrupt 2drop
     turn-off ;
+
+: initialize-floppy ['] drive-init catch 0 = if true else false then ;
 
 : floppy-read-sectors ( addr u c h s -- )
     3 pick read-sectors 512 * dma>addr ;
